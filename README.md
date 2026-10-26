@@ -26,7 +26,7 @@ jobs:
   build:
     permissions:
       contents: read
-    uses: BulmerKiln/cicd/.github/workflows/gradle-build.yml@v1
+    uses: BulmerKiln/cicd/.github/workflows/gradle-build.yml@v1.0.0
 ```
 
 A web repository passes its own languages to CodeQL:
@@ -37,7 +37,7 @@ A web repository passes its own languages to CodeQL:
       actions: read
       contents: read
       security-events: write
-    uses: BulmerKiln/cicd/.github/workflows/codeql.yml@v1
+    uses: BulmerKiln/cicd/.github/workflows/codeql.yml@v1.0.0
     with:
       languages: '["javascript-typescript", "actions"]'
 ```
@@ -59,12 +59,15 @@ Then publish a GitHub release whose tag is the version, such as `1.4.0` or `1.4.
 
 ## Conventions
 
-- Actions are referenced by major tag (`@v7`). Semgrep's rule asking for commit SHAs is turned off
-  to match. Actions and images without a major tag use an exact version.
+- Third-party actions are referenced by major tag (`@v7`). Semgrep's rule asking for commit SHAs
+  is turned off to match. Actions and images without a major tag use an exact version.
+- This repository's own workflows are referenced by exact tag (`@v1.0.0`); see Versioning.
 - Every job declares its own permissions, and checkouts don't keep credentials.
 - Releases build with Gradle's cache off, so a poisoned cache can't reach a release.
 
 ## Versioning
 
-Callers use the major tag. Each release gets an exact tag (`v1.2.0`), and `v1` moves to the latest
-`v1.x.y`. A breaking change to a workflow's inputs or behaviour starts `v2`.
+Each release is an exact, immutable tag (`v1.2.0`), and callers reference that tag. There's no
+moving major tag, so a change here reaches a repository only through a pull request in that
+repository that bumps its reference. A breaking change to a workflow's inputs or behaviour starts
+`v2.0.0`.
