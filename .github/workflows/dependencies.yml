@@ -39,6 +39,11 @@ jobs:
           distribution: temurin
           java-version: ${{ inputs.java-version }}
       - uses: gradle/actions/dependency-submission@v6
+        with:
+          # The action adds its own plugin to the build, which a repository's dependency
+          # verification metadata doesn't list. This job only reports the graph; the build job
+          # still verifies every dependency the build uses.
+          additional-arguments: --dependency-verification=lenient
 
   review:
     name: Review new dependencies
