@@ -1,0 +1,33 @@
+# This repository's own checks: actionlint over every workflow, and Semgrep's GitHub Actions rules.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions: {}
+
+jobs:
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # actionlint publishes no major-version tag, so this is an exact version.
+      - run: docker run --rm --volume "$PWD:/repo" --workdir /repo rhysd/actionlint:1.7.12 -color
+
+  semgrep:
+    name: Semgrep
+    permissions:
+      contents: read
+      security-events: write
+    uses: ./.github/workflows/semgrep.yml
+    with:
+      configs: p/github-actions p/secrets

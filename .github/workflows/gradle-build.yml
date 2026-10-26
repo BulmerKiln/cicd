@@ -1,0 +1,76 @@
+# Builds and tests a Gradle repository: compilation, static analysis, tests, coverage and every
+# other gate `./gradlew build` runs. Optionally runs PIT mutation testing as a separate job.
+
+name: Gradle build
+
+on:
+  workflow_call:
+    inputs:
+      java-version:
+        description: The JDK to build with.
+        type: string
+        default: "25"
+      tasks:
+        description: The Gradle tasks to run.
+        type: string
+        default: build
+      mutation-testing:
+        description: Also run `./gradlew pitest`.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+      # Validates the wrapper's checksum, and writes the cache only from the default branch.
+      - uses: gradle/actions/setup-gradle@v6
+      - name: Build
+        env:
+          TASKS: ${{ inputs.tasks }}
+        run: |
+          read -ra tasks <<< "$TASKS"
+          ./gradlew "${tasks[@]}" --continue
+      - name: Upload the reports
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-reports
+          path: "**/build/reports/"
+          retention-days: 14
+
+  mutation:
+    name: Mutation testing
+    if: inputs.mutation-testing
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+      - uses: gradle/actions/setup-gradle@v6
+      - name: Run PIT
+        run: ./gradlew pitest
+      - name: Upload the reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pitest-reports
+          path: "**/build/reports/pitest/"
+          retention-days: 14

@@ -1,0 +1,236 @@
+# Releases a Gradle repository to Maven Central when a GitHub release is published:
+#
+# 1. check:      the tag is a version, and the tagged commit is on the default branch
+# 2. publish:    in the protected `release` environment, builds and tests from scratch, signs every
+#                artifact and uploads the bundle to the Central Portal
+# 3. provenance: SLSA build-level-3 provenance for every artifact, attached to the release
+# 4. reproduce:  rebuilds on a fresh runner and checks every artifact is byte for byte the same
+#
+# The calling repository provides:
+# - a `release` environment with a required reviewer, holding the secrets KILN_SIGNING_KEY,
+#   KILN_SIGNING_PASSWORD, MAVEN_CENTRAL_USERNAME and MAVEN_CENTRAL_PASSWORD (a Central Portal
+#   user token)
+# - `version=` in gradle.properties, which the release overwrites with the tag
+# - a Gradle task that writes every publication, in Maven repository layout, to one directory
+
+name: Gradle release
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: The version to release; the release's tag must be exactly this.
+        type: string
+        required: true
+      java-version:
+        description: The JDK to build with.
+        type: string
+        default: "25"
+      stage-task:
+        description: Writes every publication to the staging directory.
+        type: string
+        default: stageRelease
+      staging-directory:
+        description: Where the stage task writes, relative to the repository root.
+        type: string
+        default: build/staging-deploy
+      publishing-type:
+        description: >-
+          AUTOMATIC publishes once Central validates the bundle; USER_MANAGED waits for a
+          maintainer to publish it in the Central Portal.
+        type: string
+        default: AUTOMATIC
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check the version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Check the version and tag
+        env:
+          VERSION: ${{ inputs.version }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$ ]]; then
+            echo "::error::$VERSION isn't a release version, such as 1.4.0 or 1.4.0-rc.1"
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" != "refs/tags/$VERSION" ]]; then
+            echo "::error::Releases run from the tag $VERSION, not $GITHUB_REF"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor HEAD "origin/$DEFAULT_BRANCH"; then
+            echo "::error::The tagged commit isn't on $DEFAULT_BRANCH"
+            exit 1
+          fi
+
+  publish:
+    name: Publish to Maven Central
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: release
+    outputs:
+      hashes: ${{ steps.hash.outputs.hashes }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+      # No cache: a release builds from scratch, so a poisoned cache can't reach it.
+      - uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-disabled: true
+      - name: Set the version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          sed -i -E "s/^version=.*/version=$VERSION/" gradle.properties
+          grep -qx "version=$VERSION" gradle.properties
+      - name: Build, test and stage
+        env:
+          KILN_SIGNING_KEY: ${{ secrets.KILN_SIGNING_KEY }}
+          KILN_SIGNING_PASSWORD: ${{ secrets.KILN_SIGNING_PASSWORD }}
+          STAGE_TASK: ${{ inputs.stage-task }}
+        run: |
+          if [[ -z "$KILN_SIGNING_KEY" ]]; then
+            echo "::error::The release environment has no KILN_SIGNING_KEY"
+            exit 1
+          fi
+          ./gradlew build "$STAGE_TASK" --no-build-cache
+      - name: Check every artifact is signed
+        env:
+          STAGING: ${{ inputs.staging-directory }}
+        run: |
+          unsigned=$(find "$STAGING" -type f \( -name '*.jar' -o -name '*.pom' -o -name '*.module' \) \
+            -exec sh -c '[ -f "$1.asc" ] || echo "$1"' _ {} \;)
+          if [[ -n "$unsigned" ]]; then
+            echo "::error::Unsigned artifacts:"$'\n'"$unsigned"
+            exit 1
+          fi
+      - name: Hash the artifacts
+        id: hash
+        env:
+          STAGING: ${{ inputs.staging-directory }}
+        run: |
+          cd "$STAGING"
+          find . -type f \( -name '*.jar' -o -name '*.pom' -o -name '*.module' \) -print0 \
+            | sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/hashes.txt"
+          echo "hashes=$(base64 -w0 < "$RUNNER_TEMP/hashes.txt")" >> "$GITHUB_OUTPUT"
+      - name: Bundle
+        env:
+          STAGING: ${{ inputs.staging-directory }}
+          BUNDLE: ${{ github.event.repository.name }}-${{ inputs.version }}-bundle.zip
+        run: |
+          (cd "$STAGING" && zip -qrX "$RUNNER_TEMP/$BUNDLE" .)
+          echo "BUNDLE_PATH=$RUNNER_TEMP/$BUNDLE" >> "$GITHUB_ENV"
+      - name: Upload to the Central Portal
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          PUBLISHING_TYPE: ${{ inputs.publishing-type }}
+          NAME: ${{ github.event.repository.name }} ${{ inputs.version }}
+        run: |
+          # The header lives in a private file, so the token is never in a command line or the log.
+          auth="$RUNNER_TEMP/central-auth"
+          (umask 077 && printf 'Authorization: Bearer %s\n' \
+            "$(printf '%s:%s' "$MAVEN_CENTRAL_USERNAME" "$MAVEN_CENTRAL_PASSWORD" | base64 -w0)" > "$auth")
+          api=https://central.sonatype.com/api/v1/publisher
+          query=$(jq -rn --arg type "$PUBLISHING_TYPE" --arg name "$NAME" \
+            '"publishingType=\($type | @uri)&name=\($name | @uri)"')
+          id=$(curl --fail-with-body --silent --show-error \
+            --header "@$auth" \
+            --form "bundle=@$BUNDLE_PATH" "$api/upload?$query")
+          echo "Deployment $id"
+          # Validation and publishing take minutes; allow up to an hour.
+          for _ in $(seq 1 180); do
+            status=$(curl --fail-with-body --silent --show-error --request POST \
+              --header "@$auth" "$api/status?id=$id")
+            state=$(jq -r .deploymentState <<< "$status")
+            echo "$state"
+            case "$state" in
+              PUBLISHED) exit 0 ;;
+              VALIDATED) [[ "$PUBLISHING_TYPE" == USER_MANAGED ]] && exit 0 ;;
+              FAILED) jq . <<< "$status"; exit 1 ;;
+            esac
+            sleep 20
+          done
+          echo "::error::Deployment $id didn't finish within an hour"
+          exit 1
+      - name: Keep the bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: bundle
+          path: ${{ env.BUNDLE_PATH }}
+          retention-days: 7
+
+  provenance:
+    name: Provenance
+    needs: publish
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
+    # The generator only accepts an exact version.
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: ${{ needs.publish.outputs.hashes }}
+      provenance-name: ${{ github.event.repository.name }}-${{ inputs.version }}.intoto.jsonl
+      upload-assets: true
+      upload-tag-name: ${{ inputs.version }}
+
+  asset:
+    name: Attach the bundle
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: bundle
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: gh release upload "$VERSION" ./*-bundle.zip --repo "$GITHUB_REPOSITORY" --clobber
+
+  reproduce:
+    name: Reproduce
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+      - uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-disabled: true
+      - name: Rebuild unsigned and compare
+        env:
+          VERSION: ${{ inputs.version }}
+          STAGE_TASK: ${{ inputs.stage-task }}
+          STAGING: ${{ inputs.staging-directory }}
+          HASHES: ${{ needs.publish.outputs.hashes }}
+        run: |
+          sed -i -E "s/^version=.*/version=$VERSION/" gradle.properties
+          ./gradlew "$STAGE_TASK" --no-build-cache
+          cd "$STAGING"
+          base64 -d <<< "$HASHES" | sha256sum --check --strict

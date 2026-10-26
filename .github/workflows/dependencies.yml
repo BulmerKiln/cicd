@@ -1,0 +1,59 @@
+# Sends the resolved Gradle dependencies to GitHub's dependency graph, which drives Dependabot's
+# CVE alerts on the default branch, and fails a pull request that adds a vulnerable dependency.
+
+name: Dependencies
+
+on:
+  workflow_call:
+    inputs:
+      java-version:
+        description: The JDK to resolve dependencies with.
+        type: string
+        default: "25"
+      fail-on-severity:
+        description: The lowest advisory severity that fails a pull request.
+        type: string
+        default: high
+
+permissions:
+  contents: read
+
+jobs:
+  submit:
+    name: Submit the dependency graph
+    # A pull request from a fork gets no write token, so only pushes and same-repository pull
+    # requests submit.
+    if: >-
+      github.event_name == 'push' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+      - uses: gradle/actions/dependency-submission@v6
+
+  review:
+    name: Review new dependencies
+    # Still runs when a fork's pull request skipped the submit job.
+    if: always() && github.event_name == 'pull_request' && needs.submit.result != 'failure'
+    needs: submit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/dependency-review-action@v5.0.0
+        with:
+          fail-on-severity: ${{ inputs.fail-on-severity }}
+          comment-summary-in-pr: on-failure
+          # Waits for the graph the submit job sent for this commit.
+          retry-on-snapshot-warnings: true

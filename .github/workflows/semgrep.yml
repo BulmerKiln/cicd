@@ -1,0 +1,50 @@
+# Semgrep's community rules. Any finding fails the job, and every finding goes to the repository's
+# code scanning alerts.
+
+name: Semgrep
+
+on:
+  workflow_call:
+    inputs:
+      configs:
+        description: Space-separated Semgrep rule sets.
+        type: string
+        default: p/default p/java p/kotlin p/secrets p/github-actions
+
+permissions:
+  contents: read
+
+env:
+  # Semgrep publishes no major-version tag, so this is an exact version.
+  SEMGREP_IMAGE: semgrep/semgrep:1.182.1
+
+jobs:
+  scan:
+    name: Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Scan
+        env:
+          CONFIGS: ${{ inputs.configs }}
+        # Actions are referenced by major tag (@vN) on purpose, so the rule that wants commit SHAs
+        # is off.
+        run: |
+          set --
+          for config in $CONFIGS; do set -- "$@" --config "$config"; done
+          docker run --rm --volume "$PWD:/src" --workdir /src "$SEMGREP_IMAGE" \
+            semgrep scan "$@" \
+            --exclude-rule yaml.github-actions.security.github-actions-mutable-action-tag.github-actions-mutable-action-tag \
+            --metrics off --error --sarif-output semgrep.sarif
+      - name: Upload the results
+        if: always() && hashFiles('semgrep.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
